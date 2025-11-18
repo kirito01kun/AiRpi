@@ -413,12 +413,12 @@ if acc > SUDDEN_ACCELERATION_THRESHOLD:
 
 Le système mesure la durée durant laquelle une personne reste dans un rayon spatial limité :
 
-$$\text{stillness\_time} = \max(t : \forall \tau \in [t-T, t], \|\Delta p(\tau)\| < d_\text{seuil})$$
+$$\text{stillness\_time} = \max(t : \forall \tau \in [t-T, t], \|\Delta p(\tau)\| < d_{\text{seuil}})$$
 
 où :
 - $T$ est la fenêtre temporelle d'observation
 - $\Delta p(\tau)$ est le déplacement spatial entre deux frames
-- $d_\text{seuil}$ est la distance maximale tolérée pour considérer la personne immobile
+- $d_{\text{seuil}}$ est la distance maximale tolérée pour considérer la personne immobile
 
 **Étapes Algorithmiques :**
 1. Parcours rétroactif de l'historique depuis la frame courante
