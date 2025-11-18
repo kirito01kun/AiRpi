@@ -28,6 +28,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import requests
+import json
 
 # ------------------------ Configuration ------------------------
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -53,7 +54,7 @@ NMS_THRESHOLD = 0.4
 
 # Tracking / heuristic parameters (adjust to environment)
 MAX_DISTANCE = 80  # px - max centroid distance to consider same object
-SUDDEN_ACCELERATION_THRESHOLD = 1500.0  # px/s^2 - tune for your camera
+SUDDEN_ACCELERATION_THRESHOLD = 3000.0  # px/s^2 - tune for your camera (raised default to reduce sensitivity)
 STILLNESS_TIME_THRESHOLD = 8.0  # seconds of near-zero movement -> loitering/collapse
 STILLNESS_DISTANCE_THRESHOLD = 10.0  # px - movement below this considered still
 
@@ -63,9 +64,12 @@ FALL_DESCENT_SPEED = 200.0  # px/s downward speed threshold to consider falling
 FALL_STILLNESS_TIME = 3.0  # seconds of stillness after fall to confirm
 ASPECT_RATIO_THRESHOLD = 1.2  # w/h greater than this suggests horizontal orientation
 
+# Overlay UI: duration to show top-left action box (seconds)
+OVERLAY_DURATION = 5.0
 # Restricted zone: rectangle defined as (x1,y1,x2,y2) in relative coords (fractions)
 # Example: bottom center area. Values are fractions of frame width/height
 RESTRICTED_ZONE = (0.3, 0.6, 0.7, 0.95)
+RESTRICTED_ZONE_FILE = os.path.join(MODEL_DIR, "restricted_zone.json")
 
 LOG_FILE = os.path.join(LOG_DIR, "suspicious.log")
 
@@ -233,10 +237,18 @@ class CentroidTracker:
         return math.hypot(vx, vy)
 
     def get_acceleration(self, oid, samples=4):
-        """Return approx acceleration magnitude px/sec^2 using differences of velocities."""
+        """Return approximate acceleration magnitude (px/s^2).
+
+        This computes velocities between successive position samples, then
+        computes accelerations between successive velocity samples. To
+        reduce spurious alerts from single-frame noise, we return the
+        average of the last few acceleration samples (configurable via
+        the `samples` parameter).
+        """
         hist = list(self.history.get(oid, []))
         if len(hist) < 3:
             return 0.0
+
         # compute velocities between successive pairs
         velocities = []
         for i in range(1, len(hist)):
@@ -247,18 +259,29 @@ class CentroidTracker:
                 continue
             vx = (p1[0] - p0[0]) / dt
             vy = (p1[1] - p0[1]) / dt
-            velocities.append((t1, (vx, vy)))
+            velocities.append((t1, vx, vy))
+
         if len(velocities) < 2:
             return 0.0
-        # acceleration between last two velocity samples
-        (t_prev, v_prev) = velocities[-2]
-        (t_last, v_last) = velocities[-1]
-        dt = t_last - t_prev
-        if dt <= 0:
+
+        # compute accelerations between consecutive velocity samples
+        accs = []
+        for i in range(1, len(velocities)):
+            t_prev, vx_prev, vy_prev = velocities[i-1]
+            t_last, vx_last, vy_last = velocities[i]
+            dt = t_last - t_prev
+            if dt <= 0:
+                continue
+            ax = (vx_last - vx_prev) / dt
+            ay = (vy_last - vy_prev) / dt
+            accs.append(math.hypot(ax, ay))
+
+        if not accs:
             return 0.0
-        ax = (v_last[0] - v_prev[0]) / dt
-        ay = (v_last[1] - v_prev[1]) / dt
-        return math.hypot(ax, ay)
+
+        # average the last N acceleration samples to smooth spikes
+        N = min(len(accs), max(1, samples - 1))
+        return sum(accs[-N:]) / N
 
     def time_still(self, oid, time_window=STILLNESS_TIME_THRESHOLD, dist_threshold=STILLNESS_DISTANCE_THRESHOLD):
         now = time.time()
@@ -320,6 +343,105 @@ def load_yolo(net_cfg, net_weights):
         pass
     return net
 
+def save_restricted_zone(zone):
+    """Save restricted zone to RESTRICTED_ZONE_FILE as JSON.
+
+    zone: dict with keys 'type' and 'coords'
+    type == 'rect' -> coords [x1, y1, x2, y2] (relative)
+    type == 'poly' -> coords [[x_rel,y_rel], ...]
+    """
+    try:
+        with open(RESTRICTED_ZONE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(zone, f)
+        print(f"Saved restricted zone -> {RESTRICTED_ZONE_FILE}")
+    except Exception as e:
+        print("Failed to save restricted zone:", e)
+
+def load_restricted_zone():
+    """Load restricted zone from file, return None if not found/invalid."""
+    if not os.path.exists(RESTRICTED_ZONE_FILE):
+        return None
+    try:
+        with open(RESTRICTED_ZONE_FILE, 'r', encoding='utf-8') as f:
+            zone = json.load(f)
+        # basic validation
+        if not isinstance(zone, dict) or 'type' not in zone or 'coords' not in zone:
+            return None
+        return zone
+    except Exception as e:
+        print("Failed to load restricted zone:", e)
+        return None
+
+def interactive_select_zone(orig_frame, min_points=3):
+    """Allow the user to click points on `orig_frame` to define a polygon.
+
+    - Left click to add a point
+    - Right click to remove the last point
+    - 'r' to reset, 's' to save (requires at least `min_points`), 'q' to cancel
+
+    Returns zone dict with type 'poly' and relative coords, or None if cancelled.
+    """
+    frame = orig_frame.copy()
+    overlay = frame.copy()
+    points = []
+    window_name = 'Select Restricted Zone - click to add points, r=reset, s=save, q=cancel'
+
+    def redraw():
+        nonlocal overlay
+        overlay = frame.copy()
+        # draw existing points and lines
+        for i, (x, y) in enumerate(points):
+            cv2.circle(overlay, (x, y), 4, (0, 255, 0), -1)
+            if i > 0:
+                cv2.line(overlay, points[i-1], points[i], (0, 255, 0), 2)
+        # if more than two points, show closing line to first
+        if len(points) > 2:
+            cv2.line(overlay, points[-1], points[0], (0, 200, 0), 1)
+        cv2.imshow(window_name, overlay)
+
+    def mouse_cb(event, x, y, flags, param):
+        nonlocal points
+        if event == cv2.EVENT_LBUTTONDOWN:
+            points.append((x, y))
+            redraw()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if points:
+                points.pop()
+                redraw()
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(window_name, frame)
+    cv2.setMouseCallback(window_name, mouse_cb)
+
+    print(f"Interactive selection: click points on the frame (min {min_points}).")
+    print("Controls: left-click=add, right-click=undo, r=reset, s=save, q=cancel")
+
+    while True:
+        key = cv2.waitKey(0) & 0xFF
+        if key == ord('r'):
+            # reset
+            points = []
+            redraw()
+            print("Reset points")
+        elif key == ord('q'):
+            cv2.destroyWindow(window_name)
+            print("Cancelled zone selection")
+            return None
+        elif key == ord('s'):
+            if len(points) < min_points:
+                print(f"Need at least {min_points} points to save, currently have {len(points)}")
+                continue
+            # compute relative coords
+            H, W = orig_frame.shape[:2]
+            rel = [[float(x)/W, float(y)/H] for (x, y) in points]
+            zone = {'type': 'poly', 'coords': rel}
+            cv2.destroyWindow(window_name)
+            print(f"Saved polygon with {len(points)} points")
+            return zone
+        else:
+            # ignore other keys
+            continue
+
 def get_output_layer_names(net):
     layer_names = net.getLayerNames()
     # OpenCV's `getUnconnectedOutLayers()` can return different shapes/types
@@ -357,9 +479,12 @@ def parse_args():
     p = argparse.ArgumentParser(description='Suspicious behavior detection using Tiny YOLO')
     p.add_argument('--camera', type=int, default=0, help='camera index (default 0)')
     p.add_argument('--input', type=str, default=None, help='optional video file')
+    p.add_argument('--set-zone', action='store_true', help='Interactively set restricted zone on startup')
     p.add_argument('--conf', type=float, default=CONF_THRESHOLD, help='confidence threshold')
     p.add_argument('--nms', type=float, default=NMS_THRESHOLD, help='NMS threshold')
     p.add_argument('--size', type=int, default=YOLO_INPUT_SIZE, help='YOLO input size (e.g., 416 or 320)')
+    p.add_argument('--debug', action='store_true', help='Show per-object debug values on screen')
+    p.add_argument('--acc-threshold', type=float, default=SUDDEN_ACCELERATION_THRESHOLD, help='sudden acceleration threshold (px/s^2)')
     return p.parse_args()
 
 def main():
@@ -396,26 +521,48 @@ def main():
         print('Unable to read from camera')
         sys.exit(1)
     H, W = frame.shape[:2]
-    rx1 = int(RESTRICTED_ZONE[0] * W)
-    ry1 = int(RESTRICTED_ZONE[1] * H)
-    rx2 = int(RESTRICTED_ZONE[2] * W)
-    ry2 = int(RESTRICTED_ZONE[3] * H)
+
+    # Load previously saved restricted zone (if any)
+    zone = load_restricted_zone()
+    if args.set_zone or zone is None:
+        print('No saved restricted zone found or --set-zone requested. Enter interactive selection.')
+        sel = interactive_select_zone(frame)
+        if sel is not None:
+            zone = sel
+            save_restricted_zone(zone)
+        else:
+            # fallback to default rectangle
+            zone = {'type': 'rect', 'coords': list(RESTRICTED_ZONE)}
+
+    # If zone is rect, compute pixel bounds now
+    if zone.get('type') == 'rect':
+        rx1 = int(zone['coords'][0] * W)
+        ry1 = int(zone['coords'][1] * H)
+        rx2 = int(zone['coords'][2] * W)
+        ry2 = int(zone['coords'][3] * H)
+    else:
+        # poly: store relative polygon coords; pixel coords will be computed per-frame
+        poly_rel = zone.get('coords', [])
 
     # Reset capture to start
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     print('Starting detection. Press q to quit.')
-
+    # Overlay state: show last detected action + object id (no timestamp)
+    overlay_text = ""
+    overlay_expire = 0.0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        H, W = frame.shape[:2]
+        # if poly zone, compute pixel coordinates for this frame size
+        if zone.get('type') != 'rect':
+            poly_px = [(int(x * W), int(y * H)) for (x, y) in poly_rel]
 
         blob = cv2.dnn.blobFromImage(frame, 1/255.0, (args.size, args.size), swapRB=True, crop=False)
         net.setInput(blob)
         outs = net.forward(output_layer_names)
-
-        H, W = frame.shape[:2]
         boxes = []
         confidences = []
         class_ids = []
@@ -507,30 +654,79 @@ def main():
 
                 if fall_candidate and tracker.time_still(best_id, time_window=FALL_STILLNESS_TIME, dist_threshold=STILLNESS_DISTANCE_THRESHOLD) >= FALL_STILLNESS_TIME:
                     text = f"ALERT: fall detected (ID {best_id}) height_ratio={height_ratio:.2f} vy={vy:.1f} px/s"
+                    # update overlay (no timestamp)
+                    overlay_text = f"FALL (ID {best_id})"
+                    overlay_expire = time.time() + OVERLAY_DURATION
                     log_alert(text)
                     cv2.putText(frame, "FALL", (x, y+h+75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-                # Sudden acceleration
-                if acc > SUDDEN_ACCELERATION_THRESHOLD:
+                # Sudden acceleration (use CLI/configurable threshold)
+                if acc > args.acc_threshold:
                     text = f"ALERT: sudden acceleration (ID {best_id}) acc={acc:.1f} px/s^2"
+                    # update overlay
+                    overlay_text = f"SUDDEN (ID {best_id})"
+                    overlay_expire = time.time() + OVERLAY_DURATION
                     log_alert(text)
                     cv2.putText(frame, "SUDDEN", (x, y+h+15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
                 # Long stillness
                 if still_time >= STILLNESS_TIME_THRESHOLD:
                     text = f"ALERT: long stillness (ID {best_id}) time={still_time:.1f}s"
+                    # update overlay
+                    overlay_text = f"STILLNESS (ID {best_id})"
+                    overlay_expire = time.time() + OVERLAY_DURATION
                     log_alert(text)
                     cv2.putText(frame, "STILLNESS", (x, y+h+35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
                 # Restricted zone
-                if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                in_restricted = False
+                if zone.get('type') == 'rect':
+                    if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                        in_restricted = True
+                else:
+                    # polygon check
+                    if len(poly_px) >= 3:
+                        contour = np.array(poly_px, dtype=np.int32)
+                        in_restricted = (cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) >= 0)
+
+                if in_restricted:
                     text = f"ALERT: restricted zone entered (ID {best_id})"
+                    # update overlay
+                    overlay_text = f"RESTRICTED (ID {best_id})"
+                    overlay_expire = time.time() + OVERLAY_DURATION
                     log_alert(text)
                     cv2.putText(frame, "RESTRICTED", (x, y+h+55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-        # Draw restricted zone rectangle
-        cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
-        cv2.putText(frame, "Restricted Zone", (rx1, ry1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+        # Draw restricted zone (rect or polygon)
+        if zone.get('type') == 'rect':
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
+            cv2.putText(frame, "Restricted Zone", (rx1, ry1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+        else:
+            # draw polygon
+            if len(poly_px) >= 3:
+                pts = np.array(poly_px, dtype=np.int32)
+                cv2.polylines(frame, [pts], isClosed=True, color=(0,0,255), thickness=2)
+                # place label near first vertex
+                tx, ty = poly_px[0]
+                cv2.putText(frame, "Restricted Zone", (tx, ty-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+        # Draw overlay box at top-left if active
+        if overlay_text and time.time() < overlay_expire:
+            # text rendering parameters
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.6
+            thickness = 1
+            padding_x = 8
+            padding_y = 6
+            # compute text size
+            (text_w, text_h), baseline = cv2.getTextSize(overlay_text, font, scale, thickness)
+            box_w = text_w + padding_x * 2
+            box_h = text_h + padding_y * 2 + baseline
+            # background rectangle (filled)
+            cv2.rectangle(frame, (5, 5), (5 + box_w, 5 + box_h), (50, 50, 50), -1)
+            # text
+            text_x = 5 + padding_x
+            text_y = 5 + padding_y + text_h
+            cv2.putText(frame, overlay_text, (text_x, text_y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         # Show frame
         cv2.imshow('Suspicious Behavior Monitor', frame)
