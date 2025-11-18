@@ -413,7 +413,7 @@ if acc > SUDDEN_ACCELERATION_THRESHOLD:
 
 Le système mesure la durée durant laquelle une personne reste dans un rayon spatial limité :
 
-$$\text{stillness\_time} = \max(t : \forall \tau \in [t-T, t], \|\Delta p(\tau)\| < d_{\text{seuil}})$$
+$$\mathrm{stillness}_{\mathrm{time}} = \max\{t : \forall \tau \in [t-T, t], \|\Delta p(\tau)\| < d_{\mathrm{seuil}}\}$$
 
 où :
 - $T$ est la fenêtre temporelle d'observation
