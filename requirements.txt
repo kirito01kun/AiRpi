@@ -1,0 +1,5 @@
+opencv-python-headless==4.6.0.66
+numpy>=1.21
+requests>=2.28
+
+# Note: On Raspberry Pi, install OpenCV from source or use a prebuilt package (see README).
